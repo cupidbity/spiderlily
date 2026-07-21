@@ -1,0 +1,1132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Interactive Spider Lily</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #000;
+    overflow: hidden;
+    height: 100%;
+  }
+  /* The webcam sits as a small window in the bottom corner; flowers render
+     over the whole screen */
+  /* camera sits as a window in the bottom-right corner; flowers get the
+     full screen */
+  #webcamVideo {
+    position: absolute;
+    bottom: 16px;
+    right: 16px;                 /* switch to `left: 16px` for the other corner */
+    width: 42vw;                 /* size of the video window */
+    transform: scaleX(-1);       /* mirrored selfie view */
+    border-radius: 8px;
+    z-index: 2;
+  }
+  #flowerCanvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    z-index: 1;
+    /* receives mouse input: drag = orbit the camera, scroll = zoom */
+    cursor: grab;
+  }
+  /* hand-tracking overlay drawn on top of the camera window */
+  #handOverlay {
+    position: absolute;
+    bottom: 16px;
+    right: 16px;                 /* keep in sync with #webcamVideo */
+    width: 42vw;
+    z-index: 3;
+    pointer-events: none;
+  }
+  #hud {
+    position: absolute;
+    bottom: 12px;
+    left: 12px;
+    z-index: 2;
+    color: #e08;
+    font: 12px/1.6 monospace;
+    background: rgba(0,0,0,.55);
+    padding: 8px 12px;
+    border-radius: 6px;
+    white-space: pre;
+    user-select: none;
+  }
+</style>
+
+<!-- Three.js from CDN -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.166.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.166.0/examples/jsm/",
+    "animejs": "https://cdn.jsdelivr.net/npm/animejs@3.2.2/lib/anime.es.js"
+  }
+}
+</script>
+</head>
+<body>
+
+<video id="webcamVideo" autoplay muted playsinline></video>
+<canvas id="handOverlay"></canvas>
+<canvas id="flowerCanvas"></canvas>
+<div id="hud"></div>
+
+<script type="module">
+import * as THREE from 'three';
+import anime from 'animejs';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass }     from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { HandLandmarker, FilesetResolver } from
+  'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs';
+
+/* =========================================================================
+   TWEAKABLE PARAMETERS — everything you'd want to touch lives here.
+   ========================================================================= */
+const PARAMS = {
+
+  plant: {
+    seed: 7,                  // change for a different plant shape
+    generations: 4,           // how many branch levels the plant has
+    trunkLength: 1.9,         // world units
+    lengthDecay: 0.72,        // each child branch is this fraction of its parent
+    childrenMin: 2,           // branches per split
+    childrenMax: 2,
+    spreadDeg: 46,            // how far child branches fan out from parent dir
+    curveJitter: 0.2,         // organic wobble along each branch
+    segmentsPerBranch: 10,    // line smoothness
+    stemColor: 0x2f9153,      // stalk green
+    stemRadius: 0.022,        // trunk thickness (children taper down)
+    stemTaperPerGen: 0.8,     // each generation's stems are this much thinner
+  },
+
+  flowers: {
+    scale: 1.55,              // overall flower-head size multiplier
+    maxFlowers: 3,            // total flowers on the plant, spread apart
+    floretsPerHead: 3,        // 3 florets per group, pointing away from each
+                              // other (120° apart) when bloomed
+    floretPedicel: 0.2,       // pedicel: pushes each floret's BASE away from
+                              // the head center so the flowers are separated
+    floretSpreadDeg: 58,      // pedicels stay fanned at this angle ALWAYS —
+                              // the flowers open/close on top of them
+    pedicelRadius: 0.0073,    // pedicel thickness — matches the final stalk
+                              // width (stemRadius × taper³ ÷ flowers.scale)
+    pedicelColor: 0x2c8f4e,   // pedicel green
+    stemAlignUpBias: 0.8,     // head axis = stalk direction blended toward
+                              // vertical (0 = exactly along the stalk)
+    faceJitterDeg: 8,         // small branch-tip jitter
+    // 0 = all flowers bloom together (synchronous, tracks your hand 1:1);
+    // raise toward 1 for a one-at-a-time cascade
+    bloomStagger: 0,
+  },
+
+  petals: {
+    count: 6,                 // per floret — Lycoris has 6 tepals
+    length: 0.52,             // long full ribbons
+    maxWidth: 0.095,
+    baseOffset: 0.008,        // petals meet at the flower's throat (no gap)
+    curlExponent: 2.6,        // curl concentrated toward the TIP: straight base, C-curled end
+    lengthSegments: 18,
+    widthSegments: 9,
+    edgeRippleAmp: 0.016,     // wavy Lycoris petal edges
+    edgeRippleFreq: 4.0,
+    color: 0xd8102a,          // crimson
+    emissive: 0x550000,
+  },
+
+  stamens: {
+    // the crown: one dome of filaments per flower head, radiating in ALL
+    // directions around the petal pom (sideways filaments go sideways, top
+    // ones up) — each drifts gently outward then hooks UP at the tip
+    count: 18,                // filaments per flower head (6 per floret)
+    lengthRatio: 1.3,         // filament length — just beyond the petal tips
+    rootSink: 0.03,           // how deep the filament base sinks into the corolla
+    polarMinDeg: 18,          // tightest cone angle off the floret's axis
+    polarMaxDeg: 60,          // widest fan angle off the floret's axis
+    outwardDeg: 75,           // declinate sag: bow wide/down through the middle
+    hookDeg: 115,             // then the outer half sweeps back UP past the tip
+    hookSharpness: 3.4,       // lower = upsweep spans the outer half, not just the tip
+    lengthVariation: 0.15,    // subtle per-stamen length differences
+    radius: 0.005,            // filament thickness
+    color: 0xff2233,
+    antherColor: 0xffb060,    // golden anthers (elongated, tangent-aligned)
+    antherSize: 0.009,
+  },
+
+  /* ---- THE BLOOM CHOREOGRAPHY ----------------------------------------
+     Key poses for the staged animation, matching the 18-frame reference.
+     The anime.js timeline below scrubs through these as bloom goes 0 -> 1.
+     Angles in degrees. floretTilt = whole floret away from vertical,
+     petalTilt = petal away from the floret axis, recurve = backward curl
+     of the petal spine (negative = curled inward, bud-like).           */
+  /* The pedicels stay spread (flowers.floretSpreadDeg) — only the FLOWER
+     opens and closes at the end of each pedicel.
+     petalSpin = the corolla ROTATES as it opens.                          */
+  bloomPoses: {
+    bud:    { petalTilt: 3,  recurve: -8,  petalSpin: 0,  stamen: 0    }, // closed buds atop the pedicels
+    lift:   { petalTilt: 14, recurve: 10,  petalSpin: 14, stamen: 0    }, // petals begin to separate
+    arch:   { petalTilt: 55, recurve: 70,  petalSpin: 32, stamen: 0    }, // rotates open, petals arch
+    full:   { petalTilt: 62, recurve: 112, petalSpin: 46, stamen: 1    }, // gentle down-curled tips + crown
+    settle: { petalTilt: 58, recurve: 102, petalSpin: 42, stamen: 0.96 }, // relax
+  },
+
+  interaction: {
+    // the pinch is measured RELATIVE TO YOUR HAND SIZE (thumb-index gap
+    // divided by wrist-to-knuckle length), so it responds smoothly no
+    // matter how close you are to the camera
+    pinchRatioMin: 0.35,      // fingers touching
+    pinchRatioMax: 1.5,       // fingers fully spread
+    growFullAt: 0.75,         // grow reaches MAX at this pinch value (0..1)
+    // near-direct 1:1 tracking — the plant follows your fingers linearly;
+    // just enough smoothing to absorb hand-tracking jitter
+    smoothingSeconds: 0.09,
+    // LEFT hand pinching out = grow, RIGHT hand pinching out = bloom.
+    // If your camera setup reports hands backwards, flip this:
+    swapHands: false,
+  },
+
+  debug: {
+    enabled: true,            // start in debug mode (press D to toggle live hands)
+    growValue: 1.0,           // held fully grown
+    bloomCycleSeconds: 9,     // bud -> bloom -> bud
+  },
+
+  glow: {                     // UnrealBloom
+    strength: 1.1,
+    radius: 0.55,
+    threshold: 0.12,
+  },
+
+  camera: {
+    fov: 45,
+    position: [0, 1.35, 7.2],
+    lookAt: [0, 1.45, 0],
+  },
+};
+
+/* =========================================================================
+   BLOOM TIMELINE (anime.js) — the heart of the choreography.
+   bloomState holds the live pose; the timeline keyframes it through the
+   reference's 18 frames over a virtual 1800ms. Hand input (or the debug
+   cycle) SCRUBS this timeline via .seek(), so the stages always play in
+   order, forward or backward, at whatever speed you move.
+   ========================================================================= */
+const BLOOM_TIMELINE_MS = 1800;             // 100 "ms" per reference frame
+const poses = PARAMS.bloomPoses;
+const bloomState = { ...poses.bud };
+
+const bloomTimeline = anime.timeline({ autoplay: false, easing: 'easeInOutQuad' });
+bloomTimeline
+  // frames 02-04: the petals begin to separate atop their pedicels
+  .add({ targets: bloomState,
+         petalTilt: poses.lift.petalTilt, recurve: poses.lift.recurve,
+         petalSpin: poses.lift.petalSpin,
+         duration: 350, easing: 'easeInOutCubic' }, 150)
+  // frames 05-06: the corolla ROTATES open while petals arch and curl back
+  .add({ targets: bloomState,
+         petalTilt: poses.arch.petalTilt, recurve: poses.arch.recurve,
+         petalSpin: poses.arch.petalSpin,
+         duration: 300, easing: 'easeInOutQuad' }, 500)
+  // frames 07-11: petals reach full recurve...
+  .add({ targets: bloomState,
+         petalTilt: poses.full.petalTilt, recurve: poses.full.recurve,
+         petalSpin: poses.full.petalSpin,
+         duration: 400, easing: 'easeOutCubic' }, 800)
+  // ...the stamens grow WITH the bloom: emerging from bloom ≈ 0.24 and
+  // already substantial by ≈ 0.38, lengthening all the way to the settle.
+  // bloomState.stamen is the MASTER progress; each stamen also has its
+  // own growDelay, so they lengthen individually
+  .add({ targets: bloomState, stamen: poses.full.stamen,
+         duration: 920, easing: 'easeOutCubic' }, 430)
+  // frames 12-16: everything settles / relaxes slightly
+  .add({ targets: bloomState,
+         petalTilt: poses.settle.petalTilt, recurve: poses.settle.recurve,
+         petalSpin: poses.settle.petalSpin, stamen: poses.settle.stamen,
+         duration: 350, easing: 'easeInOutSine' }, 1350)
+  // frames 17-18: hold (dead time to the end of the timeline)
+  .add({ targets: bloomState, stamen: poses.settle.stamen, duration: 100 }, 1700);
+
+function bloomStageName(bloomAmount) {
+  const virtualTime = bloomAmount * BLOOM_TIMELINE_MS;
+  if (virtualTime < 150)  return 'tight bud';
+  if (virtualTime < 500)  return 'petals lift & separate';
+  if (virtualTime < 800)  return 'petals arch & curl';
+  if (virtualTime < 1350) return 'stamens extend';
+  if (virtualTime < 1700) return 'bloom settles';
+  return 'full bloom hold';
+}
+
+/* =========================================================================
+   SEEDED RANDOM — deterministic plant shape (same every reload)
+   ========================================================================= */
+function makeSeededRandom(seed) {
+  let state = seed >>> 0;
+  return function seededRandom() {
+    state |= 0; state = state + 0x6D2B79F5 | 0;
+    let temp = Math.imul(state ^ state >>> 15, 1 | state);
+    temp = temp + Math.imul(temp ^ temp >>> 7, 61 | temp) ^ temp;
+    return ((temp ^ temp >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+/* =========================================================================
+   RENDERER / SCENE
+   ========================================================================= */
+// corner layout: flowers use the full window (set a fraction here + CSS
+// heights to carve out a bottom camera band instead)
+const CAMERA_BAND_FRACTION = 0;
+const flowerViewHeight = () =>
+  Math.round(window.innerHeight * (1 - CAMERA_BAND_FRACTION));
+
+const flowerCanvas = document.getElementById('flowerCanvas');
+const renderer = new THREE.WebGLRenderer({ canvas: flowerCanvas, antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, flowerViewHeight());
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x000000);
+
+const camera = new THREE.PerspectiveCamera(
+  PARAMS.camera.fov, window.innerWidth / flowerViewHeight(), 0.1, 100);
+camera.position.set(...PARAMS.camera.position);
+camera.lookAt(new THREE.Vector3(...PARAMS.camera.lookAt));
+
+// drag to orbit, scroll to zoom, right-drag to pan
+const orbitControls = new OrbitControls(camera, flowerCanvas);
+orbitControls.target.set(...PARAMS.camera.lookAt);
+orbitControls.enableDamping = true;
+orbitControls.dampingFactor = 0.08;
+// slow turntable — pauses while you drag, resumes after
+orbitControls.autoRotate = true;
+orbitControls.autoRotateSpeed = 0.5;   // 2.0 = one full turn per 30s
+
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloomPass = new UnrealBloomPass(
+  new THREE.Vector2(window.innerWidth, flowerViewHeight()),
+  PARAMS.glow.strength, PARAMS.glow.radius, PARAMS.glow.threshold);
+composer.addPass(bloomPass);
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / flowerViewHeight();
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, flowerViewHeight());
+  composer.setSize(window.innerWidth, flowerViewHeight());
+});
+
+/* =========================================================================
+   PLANT — recursive branching skeleton. Dashed green lines; umbel flower
+   heads sit on the final tips.
+   ========================================================================= */
+const plantGroup = new THREE.Group();
+scene.add(plantGroup);
+
+const stemMaterial = new THREE.MeshStandardMaterial({
+  color: PARAMS.plant.stemColor,
+  roughness: 0.75,
+  metalness: 0,
+});
+
+const branches = [];      // { line, generation, pointCount }
+const flowerAnchors = []; // { position, quaternion, generation }
+
+(function buildPlant() {
+  const randomFn = makeSeededRandom(PARAMS.plant.seed);
+  const conf = PARAMS.plant;
+
+  function growBranch(startPoint, direction, length, generation, parentIndex,
+                      subtreeIndex) {
+    const points = [];
+    const currentPoint = startPoint.clone();
+    const currentDir = direction.clone().normalize();
+    const stepLength = length / conf.segmentsPerBranch;
+    points.push(currentPoint.clone());
+    for (let stepIndex = 0; stepIndex < conf.segmentsPerBranch; stepIndex++) {
+      const jitter = new THREE.Vector3(
+        (randomFn() - 0.5), (randomFn() - 0.5) * 0.4, (randomFn() - 0.5))
+        .multiplyScalar(conf.curveJitter * stepLength);
+      currentDir.add(jitter.multiplyScalar(0.6)).normalize();
+      currentDir.y += 0.06 * (1 - generation / conf.generations);
+      currentDir.normalize();
+      currentPoint.addScaledVector(currentDir, stepLength);
+      points.push(currentPoint.clone());
+    }
+
+    // solid green stalk: a tapered tube along the branch curve
+    const branchCurve = new THREE.CatmullRomCurve3(points);
+    const branchRadius = PARAMS.plant.stemRadius *
+      Math.pow(PARAMS.plant.stemTaperPerGen, generation);
+    const geometry = new THREE.TubeGeometry(
+      branchCurve, conf.segmentsPerBranch * 2, branchRadius, 6, false);
+    const stemMesh = new THREE.Mesh(geometry, stemMaterial);
+    plantGroup.add(stemMesh);
+    const branchIndex = branches.length;
+    branches.push({ stemMesh, generation, indexCount: geometry.index.count,
+                    parentIndex });
+
+    const endPoint = points[points.length - 1];
+    const endDir = currentDir.clone();
+
+    if (generation < conf.generations - 1) {
+      // the TRUNK splits into one subtree per flower, spread EVENLY around
+      // the circle (120° apart for 3) — so the flower groups form a
+      // TRIANGLE in plan view instead of lining up in a plane
+      const childCount = generation === 0 ? PARAMS.flowers.maxFlowers :
+        conf.childrenMin +
+        Math.floor(randomFn() * (conf.childrenMax - conf.childrenMin + 1));
+      const ringPhase = randomFn() * Math.PI * 2;
+      for (let childIndex = 0; childIndex < childCount; childIndex++) {
+        const azimuth = ringPhase +
+          (childIndex / childCount) * Math.PI * 2 + (randomFn() - 0.5) * 0.3;
+        const spread = THREE.MathUtils.degToRad(conf.spreadDeg * (0.6 + randomFn() * 0.8));
+        const perpAxis = new THREE.Vector3(Math.cos(azimuth), 0, Math.sin(azimuth))
+          .cross(endDir).normalize();
+        const childDir = endDir.clone().applyAxisAngle(perpAxis, spread);
+        growBranch(endPoint, childDir, length * conf.lengthDecay, generation + 1,
+                   branchIndex,
+                   generation === 0 ? childIndex : subtreeIndex);
+      }
+    } else {
+      const faceQuat = new THREE.Quaternion().setFromUnitVectors(
+        new THREE.Vector3(0, 1, 0), endDir);
+      const jitterQuat = new THREE.Quaternion().setFromEuler(new THREE.Euler(
+        THREE.MathUtils.degToRad((randomFn() - 0.5) * 2 * PARAMS.flowers.faceJitterDeg),
+        randomFn() * Math.PI * 2,
+        THREE.MathUtils.degToRad((randomFn() - 0.5) * 2 * PARAMS.flowers.faceJitterDeg)));
+      faceQuat.multiply(jitterQuat);
+      flowerAnchors.push({ position: endPoint.clone(), quaternion: faceQuat,
+                           generation, tipBranchIndex: branchIndex,
+                           subtreeIndex });
+    }
+  }
+
+  growBranch(new THREE.Vector3(0, -1.6, 0), new THREE.Vector3(0, 1, 0),
+             conf.trunkLength, 0, -1, -1);
+})();
+
+/* =========================================================================
+   PETAL GEOMETRY — one geometry PER FLOWER HEAD (heads bloom individually),
+   rebuilt each frame from that head's recurve value. Narrow blade whose
+   spine progressively curls; negative recurve curls INWARD (the tight bud),
+   positive curls BACK.
+   ========================================================================= */
+function createPetalGeometry() {
+  const conf = PARAMS.petals;
+  const geometry = new THREE.BufferGeometry();
+  const vertexCount = (conf.lengthSegments + 1) * (conf.widthSegments + 1);
+  geometry.setAttribute('position',
+    new THREE.BufferAttribute(new Float32Array(vertexCount * 3), 3));
+  // vertex colors multiply the material's base red. Layers: pale pink
+  // throat at the base, soft midrib highlight, deeper crimson toward
+  // edges/tip, faint lengthwise veins, and a touch of mottle.
+  const shadeColors = new Float32Array(vertexCount * 3);
+  let colorIndex = 0;
+  for (let row = 0; row <= conf.lengthSegments; row++) {
+    const lengthT = row / conf.lengthSegments;
+    for (let col = 0; col <= conf.widthSegments; col++) {
+      const widthT = col / conf.widthSegments - 0.5;
+      const edgeness = Math.abs(widthT) * 2;
+      const tipShade = 1 - 0.55 * Math.pow(lengthT, 2.2);
+      const throat = Math.pow(Math.max(0, 1 - lengthT / 0.22), 1.6);
+      const rib = Math.exp(-Math.pow(widthT / 0.13, 2));
+      const veins = 1 + 0.10 * Math.sin(widthT * Math.PI * 6)
+        * Math.sin(Math.min(1, lengthT * 1.2) * Math.PI);
+      const mottle = 1 + (((Math.sin(lengthT * 91.7 + widthT * 47.3)
+        * 43758.5453) % 1 + 1) % 1 - 0.5) * 0.12;
+      shadeColors[colorIndex++] = tipShade * (1 - 0.18 * edgeness)
+        * (1 + 0.15 * rib + 0.15 * throat) * veins * mottle;
+      shadeColors[colorIndex++] = Math.pow(tipShade, 1.3) * (1 - 0.60 * edgeness)
+        * (1 + 2.4 * rib + 5.0 * throat) * veins * mottle;
+      shadeColors[colorIndex++] = Math.pow(tipShade, 1.15) * (1 - 0.45 * edgeness)
+        * (1 + 1.4 * rib + 2.5 * throat) * veins * mottle;
+    }
+  }
+  geometry.setAttribute('color', new THREE.BufferAttribute(shadeColors, 3));
+  const indices = [];
+  for (let row = 0; row < conf.lengthSegments; row++) {
+    for (let col = 0; col < conf.widthSegments; col++) {
+      const cornerA =  row      * (conf.widthSegments + 1) + col;
+      const cornerB = (row + 1) * (conf.widthSegments + 1) + col;
+      indices.push(cornerA, cornerB, cornerA + 1, cornerB, cornerB + 1, cornerA + 1);
+    }
+  }
+  geometry.setIndex(indices);
+  return geometry;
+}
+
+function updatePetalGeometry(petalGeometry, recurveDeg) {
+  const conf = PARAMS.petals;
+  const positions = petalGeometry.attributes.position.array;
+  const recurveRad = THREE.MathUtils.degToRad(recurveDeg);
+
+  let writeIndex = 0;
+  let spineY = 0, spineZ = 0, spineAngle = 0;
+  const stepLen = conf.length / conf.lengthSegments;
+
+  for (let row = 0; row <= conf.lengthSegments; row++) {
+    const lengthT = row / conf.lengthSegments;
+    const widthProfile = Math.sin(Math.PI * Math.min(1, lengthT * 1.08)) ** 0.85;
+    const halfWidth = conf.maxWidth * widthProfile * 0.5;
+
+    for (let col = 0; col <= conf.widthSegments; col++) {
+      const widthT = col / conf.widthSegments - 0.5;
+      const edgeness = Math.abs(widthT) * 2;
+      const ripple = conf.edgeRippleAmp * edgeness *
+        Math.sin(lengthT * conf.edgeRippleFreq * Math.PI * 2);
+      positions[writeIndex++] = widthT * 2 * halfWidth;
+      positions[writeIndex++] = spineY;
+      positions[writeIndex++] = spineZ + ripple - edgeness * 0.006 * widthProfile;
+    }
+    // curl concentrated toward the tip: base stays straight, end curls into a
+    // C — positive recurve curls the tip DOWN/outward (away from the stamens)
+    spineAngle = recurveRad * Math.pow(lengthT, conf.curlExponent);
+    spineY += Math.cos(spineAngle) * stepLen;
+    spineZ += Math.sin(spineAngle) * stepLen;
+  }
+  petalGeometry.attributes.position.needsUpdate = true;
+  petalGeometry.computeVertexNormals();
+}
+
+const petalMaterial = new THREE.MeshStandardMaterial({
+  color: PARAMS.petals.color,
+  emissive: PARAMS.petals.emissive,
+  side: THREE.DoubleSide,
+  roughness: 0.55,
+  metalness: 0.0,
+  vertexColors: true,   // tip-darkening gradient baked into the blade
+});
+
+/* =========================================================================
+   STAMEN GEOMETRY — built per STAMEN each frame (each filament has its own
+   length/curvature so the fan looks organic). The filament dips slightly,
+   then arcs progressively upward; the anther aligns with the tip tangent.
+   ========================================================================= */
+const stamenMaterial = new THREE.MeshBasicMaterial({ color: PARAMS.stamens.color });
+const antherMaterial = new THREE.MeshBasicMaterial({ color: PARAMS.stamens.antherColor });
+
+function buildStamenGeometry(extendT) {
+  const conf = PARAMS.stamens;
+  const filamentLength = PARAMS.petals.length * conf.lengthRatio * extendT;
+
+  if (filamentLength < 0.01) {
+    return { geometry: new THREE.BufferGeometry(),
+             tipPosition: new THREE.Vector3(), tipAngle: 0 };
+  }
+
+  // integrate the filament path: it runs along the pivot's +Y (its dome
+  // direction), drifts gently outward (+Z = away from the head's axis),
+  // then HOOKS back up (-Z side) right at the tip
+  const stepCount = 16;
+  const stepLength = filamentLength / stepCount;
+  const outwardRad = THREE.MathUtils.degToRad(conf.outwardDeg);
+  const hookRad = THREE.MathUtils.degToRad(conf.hookDeg);
+  const pathPoints = [new THREE.Vector3(0, 0, 0)];
+  const walker = new THREE.Vector3(0, 0, 0);
+  let pathAngle = 0;
+  for (let stepIndex = 1; stepIndex <= stepCount; stepIndex++) {
+    const pathT = stepIndex / stepCount;
+    pathAngle = outwardRad * pathT -
+      hookRad * Math.pow(pathT, conf.hookSharpness);
+    walker.y += Math.cos(pathAngle) * stepLength;
+    walker.z += Math.sin(pathAngle) * stepLength;
+    pathPoints.push(walker.clone());
+  }
+  const curve = new THREE.CatmullRomCurve3(pathPoints);
+  const tipPosition = pathPoints[pathPoints.length - 1];
+  const beforeTip = pathPoints[pathPoints.length - 2];
+  const tipTangent = tipPosition.clone().sub(beforeTip);
+  return {
+    geometry: new THREE.TubeGeometry(curve, 24, conf.radius, 5, false),
+    tipPosition: tipPosition.clone(),
+    tipAngle: Math.atan2(tipTangent.z, tipTangent.y),   // aligns the anther
+  };
+}
+
+// the filament shape is fixed — growth is animated per stamen via mesh
+// scale, so ONE geometry serves every stamen on every flower (fast)
+const stamenFullBuild = buildStamenGeometry(1);
+
+/* =========================================================================
+   FLOWER HEADS — each head is an UMBEL: several florets radiating from the
+   head center (like the reference). Each floret carries petals + stamens.
+   In the bud pose all florets stand together vertically; the timeline's
+   floretTilt fans them out into the umbrella shape.
+   ========================================================================= */
+const flowerHeads = []; // one entry per head; each head blooms individually
+const headRandom = makeSeededRandom(PARAMS.plant.seed + 99);
+
+// little green stalk connecting each floret to the head center (shared)
+const pedicelMaterial = new THREE.MeshBasicMaterial({
+  color: PARAMS.flowers.pedicelColor });
+const pedicelGeometry = new THREE.CylinderGeometry(
+  PARAMS.flowers.pedicelRadius, PARAMS.flowers.pedicelRadius * 1.5,
+  PARAMS.flowers.floretPedicel, 5);
+
+// pick the flowers by MAXIMIZING their true 3D separation (direction AND
+// height count) — a triangle in plan view with one flower sitting lower,
+// never a line and never two clumped together
+const selectedAnchors = [];
+{
+  const flowerTotal = Math.min(PARAMS.flowers.maxFlowers, flowerAnchors.length);
+  // height differences matter extra so the groups stagger vertically
+  const heightWeight = 2.0;
+  const anchorSeparation = (anchorA, anchorB) => {
+    const dx = anchorA.position.x - anchorB.position.x;
+    const dz = anchorA.position.z - anchorB.position.z;
+    const dy = (anchorA.position.y - anchorB.position.y) * heightWeight;
+    return Math.sqrt(dx * dx + dy * dy + dz * dz);
+  };
+  // start with the tip farthest out from the trunk axis
+  let firstAnchor = flowerAnchors[0];
+  let bestRadius = -1;
+  for (const anchor of flowerAnchors) {
+    const radius = Math.hypot(anchor.position.x, anchor.position.z);
+    if (radius > bestRadius) { bestRadius = radius; firstAnchor = anchor; }
+  }
+  selectedAnchors.push(firstAnchor);
+  // greedily add the anchor farthest (3D) from all chosen ones
+  while (selectedAnchors.length < flowerTotal) {
+    let bestAnchor = null;
+    let bestSeparation = -1;
+    for (const anchor of flowerAnchors) {
+      if (selectedAnchors.includes(anchor)) continue;
+      let minSeparation = Infinity;
+      for (const chosenAnchor of selectedAnchors) {
+        minSeparation = Math.min(minSeparation,
+          anchorSeparation(anchor, chosenAnchor));
+      }
+      if (minSeparation > bestSeparation) {
+        bestSeparation = minSeparation;
+        bestAnchor = anchor;
+      }
+    }
+    selectedAnchors.push(bestAnchor);
+  }
+}
+
+// prune every stalk that doesn't lead to a flower: keep only the branches
+// on the path from the trunk to each chosen flower's tip
+{
+  const keptBranchIndices = new Set();
+  for (const anchor of selectedAnchors) {
+    let walkIndex = anchor.tipBranchIndex;
+    while (walkIndex >= 0) {
+      keptBranchIndices.add(walkIndex);
+      walkIndex = branches[walkIndex].parentIndex;
+    }
+  }
+  for (let branchIndex = branches.length - 1; branchIndex >= 0; branchIndex--) {
+    if (!keptBranchIndices.has(branchIndex)) {
+      plantGroup.remove(branches[branchIndex].stemMesh);
+      branches[branchIndex].stemMesh.geometry.dispose();
+      branches.splice(branchIndex, 1);
+    }
+  }
+}
+
+for (const anchor of selectedAnchors) {
+  const headGroup = new THREE.Group();
+  headGroup.position.copy(anchor.position);
+  // align the head with its STALK's arriving direction (blended toward
+  // vertical) so the pedicel triangle fans symmetrically around the stem
+  // tip — the stalk visually continues into the center of the triangle
+  const branchDir = new THREE.Vector3(0, 1, 0).applyQuaternion(anchor.quaternion);
+  const faceDir = branchDir
+    .add(new THREE.Vector3(0, PARAMS.flowers.stemAlignUpBias, 0))
+    .normalize();
+  headGroup.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), faceDir);
+  headGroup.scale.setScalar(0.0001);
+  plantGroup.add(headGroup);
+
+  // this head's own petal geometry so it can bloom on its own schedule
+  const petalGeometry = createPetalGeometry();
+
+  const floretPivots = [];   // permanently fanned pedicel pivots
+  const petalPivots = [];    // rotation.x is animated = petalTilt
+  const stamenEntries = [];  // { filamentMesh, antherMesh }
+  const floretGroups = [];   // groups sitting AT each throat (stamen parents)
+
+  const floretCount = PARAMS.flowers.floretsPerHead;
+  // orient each head's circle of pedicels as a clean TRIANGLE from the
+  // camera: one pedicel toward the viewer, two flanking behind — the three
+  // flowers project as ▲ instead of a line
+  const localCameraDir = new THREE.Vector3(0, 0, 1)
+    .applyQuaternion(headGroup.quaternion.clone().invert());
+  const floretPhase = Math.atan2(localCameraDir.x, localCameraDir.z);
+  for (let floretIndex = 0; floretIndex < floretCount; floretIndex++) {
+    const floretPivot = new THREE.Group();
+    floretPivot.rotation.order = 'YXZ';
+    // exact 120° symmetry (near-zero jitter) so the triangle stays crisp
+    floretPivot.rotation.y = floretCount === 1 ? 0 : floretPhase +
+      (floretIndex / floretCount) * Math.PI * 2 + (headRandom() - 0.5) * 0.06;
+    // per-floret jitter so the umbel isn't perfectly regular
+    const tiltJitter = 0.92 + headRandom() * 0.16;
+    floretPivot.userData.tiltScale = tiltJitter;
+    // pedicels are PERMANENTLY fanned out; the flower blooms on top
+    floretPivot.rotation.x =
+      THREE.MathUtils.degToRad(PARAMS.flowers.floretSpreadDeg) * tiltJitter;
+    headGroup.add(floretPivot);
+    floretPivots.push(floretPivot);
+
+    const floretGroup = new THREE.Group();
+    floretGroup.position.y = PARAMS.flowers.floretPedicel;
+    floretPivot.add(floretGroup);
+    floretGroups.push(floretGroup);
+
+    // the visible pedicel stem from head center up to this floret's base
+    const pedicelMesh = new THREE.Mesh(pedicelGeometry, pedicelMaterial);
+    pedicelMesh.position.y = PARAMS.flowers.floretPedicel / 2;
+    floretPivot.add(pedicelMesh);
+
+
+    for (let petalIndex = 0; petalIndex < PARAMS.petals.count; petalIndex++) {
+      const petalPivot = new THREE.Group();
+      petalPivot.rotation.order = 'YXZ';
+      petalPivot.userData.baseAzimuth =
+        (petalIndex / PARAMS.petals.count) * Math.PI * 2;
+      petalPivot.rotation.y = petalPivot.userData.baseAzimuth;
+      const petalMesh = new THREE.Mesh(petalGeometry, petalMaterial);
+      petalMesh.position.y = PARAMS.petals.baseOffset;  // open throat at the center
+      petalPivot.add(petalMesh);
+      floretGroup.add(petalPivot);
+      petalPivots.push(petalPivot);
+    }
+
+  }
+
+  // stamens are organized PER FLORET like the real flower: each floret gets
+  // its own ring of ~6 filaments rooted at its throat, fanning in a cone
+  // around the floret's OWN axis — they arch out of the flower face and
+  // curl upward at the tips, never sideways off the head
+  const stamensPerFloret = Math.max(1,
+    Math.floor(PARAMS.stamens.count / floretCount));
+  for (let stamenIndex = 0; stamenIndex < PARAMS.stamens.count; stamenIndex++) {
+    const floretIdx = stamenIndex % floretCount;
+    const withinIndex = Math.floor(stamenIndex / floretCount);
+    const stamenPivot = new THREE.Group();
+    stamenPivot.rotation.order = 'YXZ';
+    stamenPivot.rotation.y = (withinIndex / stamensPerFloret) * Math.PI * 2 +
+      headRandom() * 0.9;
+    const tiltT = Math.min(1, withinIndex / Math.max(1, stamensPerFloret - 1));
+    // FINAL cone angle off the floret axis — but the stamen STARTS nearly
+    // along the axis (tucked in the bud) and FALLS OUTWARD as it grows
+    const finalTiltRad = THREE.MathUtils.degToRad(
+      PARAMS.stamens.polarMinDeg +
+      (PARAMS.stamens.polarMaxDeg - PARAMS.stamens.polarMinDeg) * tiltT +
+      (headRandom() - 0.5) * 8);
+    stamenPivot.rotation.x = finalTiltRad * 0.15;   // bud pose: bundled up
+    const filamentMesh = new THREE.Mesh(stamenFullBuild.geometry, stamenMaterial);
+    const antherMesh = new THREE.Mesh(
+      new THREE.SphereGeometry(PARAMS.stamens.antherSize, 6, 5), antherMaterial);
+    stamenPivot.add(filamentMesh);
+    stamenPivot.add(antherMesh);
+    floretGroups[floretIdx].add(stamenPivot);
+    // each stamen grows INDIVIDUALLY: its own final length and its own
+    // start delay within the extension window (frames 07-11)
+    const lengthScale = 1 - PARAMS.stamens.lengthVariation / 2 +
+      headRandom() * PARAMS.stamens.lengthVariation;
+    const growDelay = headRandom() * 0.3;
+    // root: the throat itself — the ORIGIN of the floret group it lives in
+    stamenEntries.push({ pivot: stamenPivot, filamentMesh, antherMesh,
+                         lengthScale, growDelay, finalTiltRad,
+                         rootStart: new THREE.Vector3(0, 0, 0) });
+  }
+
+  flowerHeads.push({ headGroup, floretPivots, petalPivots, stamenEntries, anchor,
+                     petalGeometry, orderIndex: 0 });
+}
+
+// deterministic shuffle -> the order the flowers take their turn blooming
+{
+  const shuffledIndices = flowerHeads.map((head, headIndex) => headIndex);
+  for (let shuffleIndex = shuffledIndices.length - 1; shuffleIndex > 0; shuffleIndex--) {
+    const swapIndex = Math.floor(headRandom() * (shuffleIndex + 1));
+    [shuffledIndices[shuffleIndex], shuffledIndices[swapIndex]] =
+      [shuffledIndices[swapIndex], shuffledIndices[shuffleIndex]];
+  }
+  shuffledIndices.forEach((headIndex, orderPosition) => {
+    flowerHeads[headIndex].orderIndex = orderPosition;
+  });
+}
+
+// lighting for the petals' standard material
+scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+const keyLight = new THREE.DirectionalLight(0xffe0d0, 1.4);
+keyLight.position.set(2, 4, 5);
+scene.add(keyLight);
+
+/* =========================================================================
+   GROW REVEAL — branches appear generation by generation
+   ========================================================================= */
+function applyGrow(growAmount) {
+  const totalGenerations = PARAMS.plant.generations;
+  const visibleGenerations = growAmount * totalGenerations;
+
+  for (const branch of branches) {
+    const localT = THREE.MathUtils.clamp(visibleGenerations - branch.generation, 0, 1);
+    branch.stemMesh.visible = localT > 0.001;
+    // reveal the tube along its length (aligned to whole quads)
+    const quadCount = branch.indexCount / 6;
+    branch.stemMesh.geometry.setDrawRange(0, Math.ceil(localT * quadCount) * 6);
+  }
+
+  for (const head of flowerHeads) {
+    // flower scales in during the last 40% of its tip branch's growth
+    const tipProgress = visibleGenerations - (head.anchor.generation + 0.6);
+    const localT = THREE.MathUtils.clamp(tipProgress / 0.4, 0, 1);
+    const headScale = Math.max(0.0001, localT * PARAMS.flowers.scale);
+    head.headGroup.scale.setScalar(headScale);
+  }
+}
+
+/* =========================================================================
+   BLOOM — each head gets its own slice of the bloom range so the flowers
+   take turns: head N only starts once head N-1 is mostly open. For every
+   head we scrub the shared anime.js timeline to ITS local bloom and push
+   the resulting pose into that head's geometry and pivots.
+   ========================================================================= */
+function staggeredLocalBloom(globalBloom, orderIndex, headCount) {
+  const stagger = PARAMS.flowers.bloomStagger;      // 1 = one at a time
+  const spread = 1 + stagger * (headCount - 1);
+  return THREE.MathUtils.clamp(
+    globalBloom * spread - stagger * orderIndex, 0, 1);
+}
+
+const stamenRootScratch = new THREE.Vector3();
+
+function applyBloom(globalBloom) {
+  const headCount = flowerHeads.length;
+
+  for (const head of flowerHeads) {
+    const localBloom = staggeredLocalBloom(globalBloom, head.orderIndex, headCount);
+    bloomTimeline.seek(localBloom * BLOOM_TIMELINE_MS);   // fills bloomState
+
+    updatePetalGeometry(head.petalGeometry, bloomState.recurve);
+
+    const petalTiltRad = THREE.MathUtils.degToRad(bloomState.petalTilt);
+    const petalSpinRad = THREE.MathUtils.degToRad(bloomState.petalSpin);
+
+    for (const petalPivot of head.petalPivots) {
+      petalPivot.rotation.x = petalTiltRad;
+      // the corolla rotates open as the flower blooms
+      petalPivot.rotation.y = petalPivot.userData.baseAzimuth + petalSpinRad;
+    }
+    // each stamen GROWS individually: master progress minus its own delay,
+    // smooth-stepped, then applied as mesh scale (filament lengthens out of
+    // the flower; the anther rides its tip and swells in)
+    for (const stamenEntry of head.stamenEntries) {
+      const delayedT = (bloomState.stamen - stamenEntry.growDelay) /
+        (1 - stamenEntry.growDelay);
+      const growT = THREE.MathUtils.clamp(delayedT, 0, 1);
+      const easedT = growT * growT * (3 - 2 * growT);   // smoothstep
+      const scaleNow = Math.max(stamenEntry.lengthScale * easedT, 0.0001);
+
+      // the stamen rises out of the bud first, then FALLS OUTWARD into its
+      // final dome position as it lengthens
+      const fallT = Math.pow(easedT, 1.25);
+      stamenEntry.pivot.rotation.x =
+        stamenEntry.finalTiltRad * (0.15 + 0.85 * fallT);
+      // root stays ANCHORED at its floret's throat (sunk slightly into the
+      // corolla along the filament's own direction) — only the tilt falls
+      // outward, so full-bloom filaments emerge from the flower instead of
+      // floating in mid-air on the old dome-base radius
+      stamenRootScratch.set(0, 1, 0)
+        .applyEuler(stamenEntry.pivot.rotation)
+        .multiplyScalar(-PARAMS.stamens.rootSink);
+      stamenEntry.pivot.position.copy(stamenEntry.rootStart)
+        .add(stamenRootScratch);
+
+      stamenEntry.filamentMesh.scale.setScalar(scaleNow);
+      stamenEntry.filamentMesh.visible = easedT > 0.02;
+      stamenEntry.antherMesh.visible = easedT > 0.08;
+      stamenEntry.antherMesh.position.copy(stamenFullBuild.tipPosition)
+        .multiplyScalar(scaleNow);
+      stamenEntry.antherMesh.rotation.x = stamenFullBuild.tipAngle;
+      const antherGrow = Math.min(1, easedT * 1.6);
+      stamenEntry.antherMesh.scale.set(
+        0.7 * antherGrow, 2.4 * antherGrow, 0.7 * antherGrow);
+    }
+  }
+}
+
+/* =========================================================================
+   HAND TRACKING (MediaPipe) — pinch distance -> grow / bloom
+   Leftmost hand on screen = grow, rightmost = bloom.
+   ========================================================================= */
+const webcamVideo = document.getElementById('webcamVideo');
+let handLandmarker = null;
+let trackerStatus = 'loading…';   // shown in the HUD so failures are visible
+let handsDetected = 0;
+let leftHandSeen = false;    // user's physical left hand (grow)
+let rightHandSeen = false;   // user's physical right hand (bloom)
+const rawControl = { grow: 0, bloom: 0 };
+const smoothControl = { grow: 0, bloom: 0 };
+
+async function initWebcamAndHands() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 1280, height: 720 } });
+    webcamVideo.srcObject = stream;
+    await webcamVideo.play().catch(() => {});   // some browsers need an explicit play
+  } catch (mediaError) {
+    trackerStatus = 'no camera (' + (mediaError?.name || 'error') + ')';
+    console.warn('webcam unavailable — staying in debug mode', mediaError);
+    return;
+  }
+  try {
+    const filesetResolver = await FilesetResolver.forVisionTasks(
+      'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+    const trackerOptions = {
+      baseOptions: {
+        modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+        delegate: 'GPU',
+      },
+      numHands: 2,
+      runningMode: 'VIDEO',
+    };
+    try {
+      handLandmarker = await HandLandmarker.createFromOptions(filesetResolver, trackerOptions);
+    } catch (gpuError) {
+      // GPU delegate fails on some machines/browsers — retry on CPU
+      console.warn('GPU delegate failed, retrying with CPU', gpuError);
+      trackerOptions.baseOptions.delegate = 'CPU';
+      handLandmarker = await HandLandmarker.createFromOptions(filesetResolver, trackerOptions);
+    }
+    trackerStatus = 'ready (' + trackerOptions.baseOptions.delegate + ')';
+  } catch (handError) {
+    trackerStatus = 'FAILED: ' + (handError?.message || handError).toString().slice(0, 60);
+    console.error('hand tracker failed to load — staying in debug mode', handError);
+  }
+}
+initWebcamAndHands();
+
+// pinch openness 0..1, normalized by hand size so camera distance doesn't
+// matter: ratio = (thumb tip <-> index tip) / (wrist <-> middle knuckle)
+function computePinchValue(landmarks) {
+  const thumbTip = landmarks[4];
+  const indexTip = landmarks[8];
+  const wrist = landmarks[0];
+  const middleKnuckle = landmarks[9];
+  const pinchGap = Math.hypot(thumbTip.x - indexTip.x, thumbTip.y - indexTip.y);
+  const handScale = Math.hypot(
+    wrist.x - middleKnuckle.x, wrist.y - middleKnuckle.y);
+  if (handScale < 1e-5) return 0;
+  const pinchRatio = pinchGap / handScale;
+  const { pinchRatioMin, pinchRatioMax } = PARAMS.interaction;
+  return THREE.MathUtils.clamp(
+    (pinchRatio - pinchRatioMin) / (pinchRatioMax - pinchRatioMin), 0, 1);
+}
+
+/* ---- hand-tracking overlay: skeleton + pinch drawn over the camera ---- */
+const overlayCanvas = document.getElementById('handOverlay');
+const overlayContext = overlayCanvas.getContext('2d');
+const HAND_CONNECTIONS = [
+  [0,1],[1,2],[2,3],[3,4],        // thumb
+  [0,5],[5,6],[6,7],[7,8],        // index
+  [5,9],[9,10],[10,11],[11,12],   // middle
+  [9,13],[13,14],[14,15],[15,16], // ring
+  [13,17],[17,18],[18,19],[19,20],// pinky
+  [0,17],                         // palm edge
+];
+
+function drawHandOverlay(handsFound, handednessList) {
+  if (webcamVideo.videoWidth === 0) return;
+  const overlayWidth = 640;
+  const overlayHeight = Math.round(
+    overlayWidth * webcamVideo.videoHeight / webcamVideo.videoWidth);
+  if (overlayCanvas.width !== overlayWidth ||
+      overlayCanvas.height !== overlayHeight) {
+    overlayCanvas.width = overlayWidth;
+    overlayCanvas.height = overlayHeight;
+  }
+  overlayContext.clearRect(0, 0, overlayWidth, overlayHeight);
+
+  // corner layout: the video isn't cropped, so the mapping is direct
+  const drawnWidth = overlayWidth;
+  const drawnHeight = overlayHeight;
+  const cropOffsetX = 0;
+  const cropOffsetY = 0;
+
+  for (let handIndex = 0; handIndex < handsFound.length; handIndex++) {
+    const landmarks = handsFound[handIndex];
+    const reportedLabel = handednessList[handIndex]?.[0]?.categoryName || '';
+    let isPhysicalLeft = reportedLabel === 'Right';
+    if (PARAMS.interaction.swapHands) isPhysicalLeft = !isPhysicalLeft;
+    const handColor = isPhysicalLeft ? '#43e97b' : '#ff4d6d';
+    // the video is mirrored on screen, so mirror x to match what you see
+    const toScreenX = (landmark) =>
+      cropOffsetX + (1 - landmark.x) * drawnWidth;
+    const toScreenY = (landmark) =>
+      cropOffsetY + landmark.y * drawnHeight;
+
+    // skeleton
+    overlayContext.globalAlpha = 0.75;
+    overlayContext.strokeStyle = handColor;
+    overlayContext.lineWidth = 2;
+    overlayContext.beginPath();
+    for (const [fromIdx, toIdx] of HAND_CONNECTIONS) {
+      overlayContext.moveTo(toScreenX(landmarks[fromIdx]), toScreenY(landmarks[fromIdx]));
+      overlayContext.lineTo(toScreenX(landmarks[toIdx]), toScreenY(landmarks[toIdx]));
+    }
+    overlayContext.stroke();
+
+    // joints
+    overlayContext.fillStyle = handColor;
+    for (const landmark of landmarks) {
+      overlayContext.beginPath();
+      overlayContext.arc(toScreenX(landmark), toScreenY(landmark), 3, 0, Math.PI * 2);
+      overlayContext.fill();
+    }
+
+    // the PINCH: thumb tip <-> index tip, gold, with the live value
+    const thumbTip = landmarks[4];
+    const indexTip = landmarks[8];
+    const pinchValue = computePinchValue(landmarks);
+    overlayContext.globalAlpha = 1;
+    overlayContext.strokeStyle = '#ffcf5e';
+    overlayContext.lineWidth = 4;
+    overlayContext.beginPath();
+    overlayContext.moveTo(toScreenX(thumbTip), toScreenY(thumbTip));
+    overlayContext.lineTo(toScreenX(indexTip), toScreenY(indexTip));
+    overlayContext.stroke();
+    for (const tipLandmark of [thumbTip, indexTip]) {
+      overlayContext.fillStyle = '#ffcf5e';
+      overlayContext.beginPath();
+      overlayContext.arc(toScreenX(tipLandmark), toScreenY(tipLandmark), 6, 0, Math.PI * 2);
+      overlayContext.fill();
+    }
+    const midX = (toScreenX(thumbTip) + toScreenX(indexTip)) / 2;
+    const midY = (toScreenY(thumbTip) + toScreenY(indexTip)) / 2 - 12;
+    const pinchLabel = `${isPhysicalLeft ? 'grow' : 'bloom'} ${pinchValue.toFixed(2)}`;
+    overlayContext.font = 'bold 18px monospace';
+    overlayContext.textAlign = 'center';
+    overlayContext.fillStyle = '#fff';
+    overlayContext.fillText(pinchLabel, midX, midY);
+  }
+}
+
+function readHands() {
+  if (!handLandmarker || webcamVideo.readyState < 2) {
+    handsDetected = 0; leftHandSeen = false; rightHandSeen = false; return;
+  }
+  let result;
+  try {
+    result = handLandmarker.detectForVideo(webcamVideo, performance.now());
+  } catch (detectError) {
+    // never let a detection hiccup kill the render loop
+    trackerStatus = 'detect error: ' + (detectError?.message || '').slice(0, 40);
+    handsDetected = 0; leftHandSeen = false; rightHandSeen = false; return;
+  }
+  const handsFound = result.landmarks || [];
+  const handednessList = result.handedness || result.handednesses || [];
+  handsDetected = handsFound.length;
+  leftHandSeen = false;
+  rightHandSeen = false;
+  drawHandOverlay(handsFound, handednessList);
+  if (handsFound.length === 0) return;
+
+  for (let handIndex = 0; handIndex < handsFound.length; handIndex++) {
+    const landmarks = handsFound[handIndex];
+    const pinchValue = computePinchValue(landmarks);
+
+    // MediaPipe labels handedness assuming a MIRRORED (selfie) image.
+    // We feed it the raw (unmirrored) webcam, so the label is flipped:
+    // reported "Right" = the user's physical LEFT hand, and vice versa.
+    const reportedLabel = handednessList[handIndex]?.[0]?.categoryName || '';
+    let isPhysicalLeft = reportedLabel === 'Right';
+    if (PARAMS.interaction.swapHands) isPhysicalLeft = !isPhysicalLeft;
+
+    if (isPhysicalLeft) {
+      rawControl.grow = pinchValue;    // LEFT hand -> grow
+      leftHandSeen = true;
+    } else {
+      rawControl.bloom = pinchValue;   // RIGHT hand -> bloom
+      rightHandSeen = true;
+    }
+  }
+}
+
+/* =========================================================================
+   MAIN LOOP
+   ========================================================================= */
+const hud = document.getElementById('hud');
+let debugEnabled = PARAMS.debug.enabled;
+let hudVisible = true;
+let pinnedBloom = null;         // null = auto-cycle; 0..1 = held at that value
+
+window.PARAMS = PARAMS;         // tweak live from the browser console!
+window.bloomState = bloomState; // watch the pose live
+window.scenery = { scene, camera, plantGroup, flowerHeads };  // console debugging
+
+window.addEventListener('keydown', (keyEvent) => {
+  if (keyEvent.key === 'd' || keyEvent.key === 'D') debugEnabled = !debugEnabled;
+  if (keyEvent.key === 'h' || keyEvent.key === 'H') {
+    hudVisible = !hudVisible;
+    hud.style.display = hudVisible ? 'block' : 'none';
+  }
+  // pin the debug bloom at a phase for tweaking: 1=bud 2=arch 3=full 0=cycle
+  if (keyEvent.key === '1') pinnedBloom = 0;
+  if (keyEvent.key === '2') pinnedBloom = 0.42;
+  if (keyEvent.key === '3') pinnedBloom = 1;
+  if (keyEvent.key === '0') pinnedBloom = null;
+});
+
+const clock = new THREE.Clock();
+let lastHandRead = 0;
+
+function animate() {
+  requestAnimationFrame(animate);
+  const deltaSeconds = Math.min(clock.getDelta(), 0.5);
+  const elapsedSeconds = clock.getElapsedTime();
+
+  // track hands even in debug mode so the overlay always shows what
+  // MediaPipe sees (control values only apply in live mode)
+  if (elapsedSeconds - lastHandRead > 1 / 30) {
+    readHands();
+    lastHandRead = elapsedSeconds;
+  }
+
+  let targetGrow, targetBloom;
+  if (debugEnabled) {
+    targetGrow = PARAMS.debug.growValue;
+    targetBloom = pinnedBloom !== null ? pinnedBloom :
+      0.5 - 0.5 * Math.cos(
+        (elapsedSeconds / PARAMS.debug.bloomCycleSeconds) * Math.PI * 2);
+  } else {
+    // grow hits max at growFullAt (e.g. 0.75) so you don't need a full spread
+    targetGrow = THREE.MathUtils.clamp(
+      rawControl.grow / PARAMS.interaction.growFullAt, 0, 1);
+    targetBloom = rawControl.bloom;
+  }
+
+  // lag filter — time-based, so any framerate feels the same
+  const alpha = 1 - Math.exp(-deltaSeconds / PARAMS.interaction.smoothingSeconds);
+  smoothControl.grow += (targetGrow - smoothControl.grow) * alpha;
+  smoothControl.bloom += (targetBloom - smoothControl.bloom) * alpha;
+
+  applyGrow(smoothControl.grow);
+  applyBloom(smoothControl.bloom);
+
+  plantGroup.rotation.z = Math.sin(elapsedSeconds * 0.3) * 0.02;
+
+  orbitControls.update();
+  composer.render();
+
+  if (hudVisible) {
+    hud.textContent =
+      `mode:  ${debugEnabled ? (pinnedBloom !== null ? 'DEBUG (pinned)' : 'DEBUG (auto-cycle)') : 'LIVE HANDS'}` +
+      `   [D] toggle  [H] hide  [1/2/3] pin  [0] cycle  drag=orbit\n` +
+      `grow:  ${smoothControl.grow.toFixed(2)}  (left hand)\n` +
+      `bloom: ${smoothControl.bloom.toFixed(2)}  (right hand — ${bloomStageName(smoothControl.bloom)})\n` +
+      `hands: L${leftHandSeen ? '✓' : '·'} R${rightHandSeen ? '✓' : '·'}  tracker: ${trackerStatus}`;
+  }
+}
+animate();
+</script>
+</body>
+</html>
