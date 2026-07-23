@@ -1,2 +1,5 @@
 .DS_Store
 Thumbs.db
+
+# TouchDesigner MediaPipe engine — 172MB, over GitHub 100MB limit (kept local, download separately)
+toxes/MediaPipe.tox

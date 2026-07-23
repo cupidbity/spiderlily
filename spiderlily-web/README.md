@@ -4,8 +4,7 @@ A coded port of the TouchDesigner piece: MediaPipe hand tracking grows and bloom
 a procedural spider lily plant rendered full-screen, with your webcam as a
 window in the bottom-right corner (the flowers overlay it, slightly see-through).
 
-The bloom is a staged **anime.js timeline** (based on an 18-frame botanical
-reference): tight bud → petals lift & separate → arch outward & curl back →
+The bloom is a staged **anime.js timeline**: tight bud → petals lift & separate → arch outward & curl back →
 stamens extend → full bloom → settle. Your hand (or the debug cycle) *scrubs*
 this timeline, so the stages always play in order, forward or backward.
 Each flower head is an umbel of several florets, like a real Lycoris.

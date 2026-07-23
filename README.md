@@ -13,6 +13,20 @@ the flowers.
 
 ---
 
+## Get the code
+
+Clone the repo:
+
+```bash
+git clone https://github.com/cupidbity/spiderlily.git
+cd spiderlily
+```
+
+That's all you need for the **web version**. For the **TouchDesigner version** you
+also need to add the MediaPipe engine — see that section below.
+
+---
+
 ## Web version (3D visualiser)
 
 A single self-contained `spiderlily-web/index.html`. It pulls Three.js and
@@ -53,15 +67,27 @@ Full interaction details, keys, and tweakable parameters are in
 
 1. Install **TouchDesigner** (free non-commercial license) from
    [derivative.ca](https://derivative.ca/download).
-2. Double-click **`InteractiveFlower.43.toe`**, or launch TouchDesigner and use
+2. Get the **MediaPipe engine** (see below) into the `toxes/` folder.
+3. Double-click **`InteractiveFlower.43.toe`**, or launch TouchDesigner and use
    **File → Open** to select it.
-3. Press the play/perform controls to run it; a connected webcam drives the hand
+4. Press the play/perform controls to run it; a connected webcam drives the hand
    tracking.
 
-> **Note:** the TouchDesigner project uses MediaPipe hand-tracking components. If
-> the network shows missing-operator errors on open, install/enable
-> TouchDesigner's MediaPipe components (or the matching `.tox` tracking modules)
-> so the tracking chain resolves.
+### MediaPipe dependency
+
+The tracking components live in **`toxes/`** — `hand_tracking.tox` (what this
+piece uses) plus the other MediaPipe modules are all included in the repo.
+
+The one exception is **`toxes/MediaPipe.tox`**, the ~172 MB MediaPipe engine those
+modules depend on. It exceeds GitHub's 100 MB file limit, so it is **not** stored
+in the repo. Without it, the tracking chain won't resolve and MediaPipe won't run.
+
+To get it, download the **MediaPipe for TouchDesigner** plugin and place
+`MediaPipe.tox` into the `toxes/` folder:
+- https://github.com/torinmb/mediapipe-touchdesigner (Releases)
+
+Once `toxes/MediaPipe.tox` is present alongside the other toxes, open the `.toe`
+and the hand tracking will work.
 
 ---
 
