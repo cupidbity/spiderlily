@@ -1,0 +1,5 @@
+.DS_Store
+Thumbs.db
+
+# MediaPipe engine (~172MB) — provided as a release download, not committed
+toxes/MediaPipe.tox
